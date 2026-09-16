@@ -70,6 +70,7 @@ int main(int argc, char **argv) {
    * in the prompt explains each required system interface.
    */
 
+  int failure = 0;
   Child *children = malloc((size_t)child_count * sizeof(*children));
   if(children == NULL) {
     perror("malloc");
@@ -81,6 +82,7 @@ int main(int argc, char **argv) {
     pid_t pid = fork();
     if (pid == -1) {
     perror("fork");
+    failure = 1;
     break;
     }
 
@@ -101,73 +103,136 @@ int main(int argc, char **argv) {
   }
 
 
-  for(int i = 0; i < spawned; i++) {
-    struct timespec start;
-    clock_gettime(CLOCK_MONOTONIC, &start);
+  if(!failure){
+    for(int i = 0; i < spawned; i++) {
+      struct timespec start;
+      if (clock_gettime(CLOCK_MONOTONIC, &start) == -1) {
+        perror("clock_gettime");
+        failure = 1;
+        break;
+      }
 
-    for(;;) {
-      FILE *file_stream;
-      char path[64];
-      long process_pid;
-      char process_name[256];
-      char process_state;
+      for(;;) {
+        FILE *file_stream;
+        char path[64];
+        long process_pid;
+        char process_name[256];
+        char process_state;
+        
+        int ret = snprintf(path, sizeof(path), "/proc/%ld/stat",  (long)children[i].pid);
+        if(ret < 0 || ret >= (int)sizeof(path)) {
+          fprintf(stderr, "Failed to build /proc for pid %ld\n", (long)children[i].pid);
+          failure = 1;
+          break;
+        }
+
+        file_stream = fopen(path, "r");
+
+        if (file_stream == NULL) {
+          if(errno == ENOENT) { } else {
+            perror(path);
+            failure = 1;
+            break;
+          }
+        } else {
+          int fields = fscanf(file_stream, "%ld (%255[^)]) %c", &process_pid, process_name, &process_state);
+          fclose(file_stream);
+
+          if (fields == 3 &&
+              process_pid == (long)children[i].pid &&
+              strcmp(process_name, WORKER_NAME) == 0 &&
+              process_state == 'Z') {
+            printf("ZOMBIE index=%d pid=%ld name=%s state=%c\n", i, process_pid, process_name, process_state);
+            break;
+          }
+        }
+
+      struct timespec now;
+      if(clock_gettime(CLOCK_MONOTONIC, &now) == -1){
+        perror("clock_gettime");
+        failure = 1;
+        break;
+      }
+
+      long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000L + (now.tv_nsec - start.tv_nsec) / 1000000L;
       
-      snprintf(path, sizeof(path), "/proc/%ld/stat",  (long)children[i].pid);
+      if (elapsed_ms > ZOMBIE_TIMEOUT_MS) {
+        fprintf(stderr, "Time exceeded waiting for zombie pid=%ld\n", (long)children[i].pid);
+        errno = ETIMEDOUT;
+        failure = 1;
+        break;
+      }
 
-      file_stream = fopen(path, "r");
+      struct timespec delay = {
+        .tv_sec = 0,
+        .tv_nsec = POLL_INTERVAL_MS * 1000000L
+      };
 
-      if (file_stream != NULL) {
-        int fields = fscanf(file_stream, "%ld (%255[^)]) %c", &process_pid, process_name, &process_state);
-        fclose(file_stream);
-
-        if (fields == 3 &&
-            process_pid == (long)children[i].pid &&
-            strcmp(process_name, WORKER_NAME) == 0 &&
-            process_state == 'Z') {
-          printf("ZOMBIE pid=%ld name=%s state=%c\n", process_pid, process_name, process_state);
+      while(nanosleep(&delay, &delay) == -1){
+        if (errno != EINTR) {
+          perror("nanosleep");
+          failure = 1;
           break;
         }
       }
-
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-
-    long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000L + (now.tv_nsec - start.tv_nsec) / 1000000L;
-    
-    if (elapsed_ms > ZOMBIE_TIMEOUT_MS) {
-      perror("Time exceeded looking for zombie");
-      break;
+      }
+      if(failure) {
+        break;
+      }  
     }
-
-    struct timespec delay = {
-      .tv_sec = 0,
-      .tv_nsec = POLL_INTERVAL_MS * 1000000L
-    };
-
-    nanosleep(&delay, NULL);
-
-    }  
   }
+    
+
+  
     
     
   int reaped = 0;
+  if (failure) {
+    for (int i = 0; i < spawned; i++) {
+      int status = 0;
+      while (waitpid(children[i].pid, &status, 0) == -1 && errno == EINTR) {
+        /* retry */
+      }
+    }
+
+    free(children);
+    return 1;
+  }
   for (int i = 0; i < spawned; i++) {
     int status = 0;
     pid_t reapedPID = waitpid(children[i].pid, &status, 0);
 
     if (reapedPID == -1) {
+      if(errno == EINTR) {
+        i--;
+        continue;
+      }
       perror("waitpid");
       continue;
     }
-
-    int code = -1;
-    if (reapedPID == children[i].pid && WIFEXITED(status)) {
-      code = WEXITSTATUS(status);
+    if (reapedPID != children[i].pid) {
+      fprintf(stderr, "Unexpected waitpid result %ld for pid %ld\n",
+              (long)reapedPID, (long)children[i].pid);
+      continue;
+    }
+    if (!WIFEXITED(status)) {
+      fprintf(stderr, "Child %ld did not exit normally\n", (long)children[i].pid);
+      continue;
     }
 
-    printf("REAP index=%d pid=%ld exit=%d\n", i, (long)reapedPID, code);
+
+
+    int actual_exit = WEXITSTATUS(status);
+    if (actual_exit != children[i].expected_exit) {
+      fprintf(stderr,
+              "Child %ld exited with %d, expected %d\n",
+              (long)children[i].pid, actual_exit, children[i].expected_exit);
+      continue;
+    }
+
+    printf("REAP index=%d pid=%ld exit=%d\n", i, (long)children[i].pid, actual_exit);
     reaped++;
-  }
+  }  
   printf("DONE spawned=%d reaped=%d\n", spawned, reaped);
   free(children);
 }
