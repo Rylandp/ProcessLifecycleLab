@@ -70,5 +70,104 @@ int main(int argc, char **argv) {
    * in the prompt explains each required system interface.
    */
 
-  return 0;
+  Child *children = malloc((size_t)child_count * sizeof(*children));
+  if(children == NULL) {
+    perror("malloc");
+    return 1;
+  }
+  int spawned=0;
+
+  for(int i = 0; i < child_count; i++) {
+    pid_t pid = fork();
+    if (pid == -1) {
+    perror("fork");
+    break;
+    }
+
+    if (pid == 0) {
+      char exit_code[16];
+
+      snprintf(exit_code, sizeof(exit_code), "%d", 10 + i);
+      execl( WORKER_PATH, WORKER_NAME, exit_code, (char *)NULL);
+
+      perror("execl");
+      _exit(127);
+    }
+
+    children[spawned].pid = pid;
+    children[spawned].expected_exit = 10 + i;
+    printf("SPAWN index=%d pid=%ld exit=%d\n", i, (long)pid, children[spawned].expected_exit);
+    spawned++;
+  }
+
+
+  for(int i = 0; i < spawned; i++) {
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for(;;) {
+      FILE *file_stream;
+      char path[64];
+      long process_pid;
+      char process_name[256];
+      char process_state;
+      
+      snprintf(path, sizeof(path), "/proc/%ld/stat",  (long)children[i].pid);
+
+      file_stream = fopen(path, "r");
+
+      if (file_stream != NULL) {
+        int fields = fscanf(file_stream, "%ld (%255[^)]) %c", &process_pid, process_name, &process_state);
+        fclose(file_stream);
+
+        if (fields == 3 &&
+            process_pid == (long)children[i].pid &&
+            strcmp(process_name, WORKER_NAME) == 0 &&
+            process_state == 'Z') {
+          printf("ZOMBIE pid=%ld name=%s state=%c\n", process_pid, process_name, process_state);
+          break;
+        }
+      }
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    long elapsed_ms = (now.tv_sec - start.tv_sec) * 1000L + (now.tv_nsec - start.tv_nsec) / 1000000L;
+    
+    if (elapsed_ms > ZOMBIE_TIMEOUT_MS) {
+      perror("Time exceeded looking for zombie");
+      break;
+    }
+
+    struct timespec delay = {
+      .tv_sec = 0,
+      .tv_nsec = POLL_INTERVAL_MS * 1000000L
+    };
+
+    nanosleep(&delay, NULL);
+
+    }  
+  }
+    
+    
+  int reaped = 0;
+  for (int i = 0; i < spawned; i++) {
+    int status = 0;
+    pid_t reapedPID = waitpid(children[i].pid, &status, 0);
+
+    if (reapedPID == -1) {
+      perror("waitpid");
+      continue;
+    }
+
+    int code = -1;
+    if (reapedPID == children[i].pid && WIFEXITED(status)) {
+      code = WEXITSTATUS(status);
+    }
+
+    printf("REAP index=%d pid=%ld exit=%d\n", i, (long)reapedPID, code);
+    reaped++;
+  }
+  printf("DONE spawned=%d reaped=%d\n", spawned, reaped);
+  free(children);
 }
